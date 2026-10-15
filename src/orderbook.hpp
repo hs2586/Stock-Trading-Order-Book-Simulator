@@ -131,6 +131,8 @@ public:
     }
 
     const std::vector<Trade>& trades() const { return trades_; }
+    int64_t bestBid() const { return bids_.empty() ? 0 : bids_.begin()->first; }
+    int64_t bestAsk() const { return asks_.empty() ? 0 : asks_.begin()->first; }
 
     void printTrades() const {
         std::cout << "\nTrades (" << trades_.size() << "):\n";
