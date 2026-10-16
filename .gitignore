@@ -8,3 +8,4 @@ simulate_asan
 analyzer
 analysis_report.txt
 sizeof_demo
+ai_test
