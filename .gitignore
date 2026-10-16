@@ -5,3 +5,5 @@ run_tests.dSYM/orderbook
 simulate
 simulate_asan
 *.dSYM/
+analyzer
+analysis_report.txt
