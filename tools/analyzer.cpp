@@ -1,4 +1,4 @@
-// analyzer.cpp - Day 5: scan C++ code for risky patterns and print a report
+// analyzer.cpp - Day 6 (part A): scan C++ code, print a report, write an auto-fixed copy
 //
 // Usage:
 //   ./analyzer path/to/file.cpp     analyze a file
@@ -18,7 +18,9 @@ struct Rule {
     std::string cwe;        // official weakness number, see cwe.mitre.org
     std::string title;
     std::string advice;
-    std::regex  pattern;
+    std::regex  pattern;    // detects the problem
+    std::regex  fixPattern; // used to rewrite the line (only if fixTo is not empty)
+    std::string fixTo;      // replacement text; empty = no safe automatic fix
 };
 
 // One problem found in the user's code
@@ -26,28 +28,49 @@ struct Finding {
     size_t      line;       // line number, starting at 1
     const Rule* rule;
     std::string code;       // the offending line, trimmed
+    bool        fixed;      // true if the automatic fixer rewrote this line
 };
+
+// Small helper so rules without an auto-fix stay short
+static Rule makeRule(const std::string& id, const std::string& severity, const std::string& cwe,
+                     const std::string& title, const std::string& advice, const char* detect,
+                     const char* fixFrom = "x^", const std::string& fixTo = "") {
+    return Rule{id, severity, cwe, title, advice, std::regex(detect), std::regex(fixFrom), fixTo};
+}
 
 static std::vector<Rule> buildRules() {
     return {
-        {"CPP-001", "CRITICAL", "CWE-242", "gets() cannot limit input size",
-         "gets() was removed from C++14. Use std::getline or fgets with a size.",
-         std::regex(R"(\bgets\s*\()")},
-        {"CPP-002", "HIGH", "CWE-120", "strcpy() has no bounds checking",
-         "Use std::string, or snprintf with the destination size.",
-         std::regex(R"(\bstrcpy\s*\()")},
-        {"CPP-003", "HIGH", "CWE-120", "sprintf() can overflow the buffer",
-         "Use snprintf with the buffer size, or std::ostringstream.",
-         std::regex(R"(\bsprintf\s*\()")},
-        {"CPP-004", "HIGH", "CWE-134", "printf with a non-literal format string",
-         "If the text is user-controlled, attackers can read or write memory. Use printf(\"%s\", text).",
-         std::regex(R"(\bprintf\s*\(\s*[A-Za-z_]\w*\s*\))")},
-        {"CPP-005", "HIGH", "CWE-78", "OS command execution",
-         "system() and popen() allow command injection. Avoid them or validate input strictly.",
-         std::regex(R"(\b(system|popen)\s*\()")},
-        {"CPP-006", "MEDIUM", "CWE-338", "rand() is predictable and low quality",
-         "Use <random> (std::mt19937). For security-sensitive values use std::random_device.",
-         std::regex(R"(\brand\s*\(\s*\))")},
+        makeRule("CPP-001", "CRITICAL", "CWE-242", "gets() cannot limit input size",
+                 "gets() was removed from C++14. Use std::getline or fgets with a size.",
+                 R"(\bgets\s*\()",
+                 R"(\bgets\s*\(\s*(\w+)\s*\))",
+                 "fgets($1, sizeof($1), stdin) /* AUTOFIX: dest must be an array */"),
+        makeRule("CPP-002", "HIGH", "CWE-120", "strcpy() has no bounds checking",
+                 "Use std::string, or snprintf with the destination size.",
+                 R"(\bstrcpy\s*\()",
+                 R"(\bstrcpy\s*\(\s*(\w+)\s*,\s*([^;]+?)\s*\)\s*;)",
+                 "snprintf($1, sizeof($1), \"%s\", $2); /* AUTOFIX: dest must be an array */"),
+        makeRule("CPP-003", "HIGH", "CWE-120", "sprintf() can overflow the buffer",
+                 "Use snprintf with the buffer size, or std::ostringstream.",
+                 R"(\bsprintf\s*\()",
+                 R"(\bsprintf\s*\(\s*(\w+)\s*,)",
+                 "snprintf($1, sizeof($1),"),
+        makeRule("CPP-004", "HIGH", "CWE-134", "printf with a non-literal format string",
+                 "If the text is user-controlled, attackers can read or write memory. Use printf(\"%s\", text).",
+                 R"(\bprintf\s*\(\s*[A-Za-z_]\w*\s*\))",
+                 R"(\bprintf\s*\(\s*([A-Za-z_]\w*)\s*\))",
+                 "printf(\"%s\", $1)"),
+        makeRule("CPP-005", "HIGH", "CWE-78", "OS command execution",
+                 "system() and popen() allow command injection. Avoid them or validate input strictly.",
+                 R"(\b(system|popen)\s*\()"),
+        makeRule("CPP-006", "MEDIUM", "CWE-338", "rand() is predictable and low quality",
+                 "Use <random> (std::mt19937). For security-sensitive values use std::random_device.",
+                 R"(\brand\s*\(\s*\))"),
+        makeRule("CPP-007", "HIGH", "CWE-120", "strcat() has no bounds checking",
+                 "Use std::string::append, or strncat with the remaining space.",
+                 R"(\bstrcat\s*\()",
+                 R"(\bstrcat\s*\(\s*(\w+)\s*,\s*([^;]+?)\s*\)\s*;)",
+                 "strncat($1, $2, sizeof($1) - strlen($1) - 1); /* AUTOFIX: dest must be an array */"),
     };
 }
 
@@ -84,39 +107,57 @@ static std::string stripComments(const std::string& line, bool& inBlock) {
     return out;
 }
 
+// Finds problems AND builds fixedLines, a copy of the code with safe fixes applied.
+// The original lines are never changed.
 static std::vector<Finding> scan(const std::vector<std::string>& lines,
-                                 const std::vector<Rule>& rules) {
+                                 const std::vector<Rule>& rules,
+                                 std::vector<std::string>& fixedLines) {
     std::vector<Finding> findings;
+    fixedLines = lines;
     bool inBlock = false;
     for (size_t i = 0; i < lines.size(); ++i) {
         const std::string code = stripComments(lines[i], inBlock);
         for (const Rule& rule : rules) {
-            if (std::regex_search(code, rule.pattern)) {
-                findings.push_back({i + 1, &rule, trim(lines[i])});
+            if (!std::regex_search(code, rule.pattern)) continue;
+
+            bool fixed = false;
+            if (!rule.fixTo.empty()) {
+                const std::string rewritten =
+                    std::regex_replace(fixedLines[i], rule.fixPattern, rule.fixTo);
+                if (rewritten != fixedLines[i]) {
+                    fixedLines[i] = rewritten;
+                    fixed = true;
+                }
             }
+            findings.push_back({i + 1, &rule, trim(lines[i]), fixed});
         }
     }
     return findings;
 }
 
 static std::string buildReport(const std::string& name, const std::vector<Finding>& findings) {
-    int critical = 0, high = 0, medium = 0;
+    int critical = 0, high = 0, medium = 0, autoFixed = 0;
     for (const Finding& f : findings) {
         if (f.rule->severity == "CRITICAL") ++critical;
         else if (f.rule->severity == "HIGH") ++high;
         else ++medium;
+        if (f.fixed) ++autoFixed;
     }
 
     std::ostringstream out;
     out << "=== Vulnerability Report: " << name << " ===\n"
         << "Findings: " << findings.size() << "  (critical " << critical
-        << ", high " << high << ", medium " << medium << ")\n\n";
+        << ", high " << high << ", medium " << medium << ")\n"
+        << "Auto-fixed: " << autoFixed << "   Need manual/AI fix: "
+        << (findings.size() - autoFixed) << "\n\n";
 
     for (const Finding& f : findings) {
         out << "[" << f.rule->severity << "] " << f.rule->id << " (" << f.rule->cwe << ")"
             << " line " << f.line << ": " << f.rule->title << "\n"
             << "    code:   " << f.code << "\n"
-            << "    advice: " << f.rule->advice << "\n\n";
+            << "    advice: " << f.rule->advice << "\n"
+            << "    status: " << (f.fixed ? "auto-fixed in autofixed.cpp" : "needs manual or AI fix")
+            << "\n\n";
     }
     if (findings.empty()) {
         out << "No known risky patterns found.\n"
@@ -150,7 +191,8 @@ int main(int argc, char** argv) {
     }
 
     const std::vector<Rule> rules = buildRules();
-    std::vector<Finding> findings = scan(lines, rules);
+    std::vector<std::string> fixedLines;
+    std::vector<Finding> findings = scan(lines, rules, fixedLines);
 
     // Most severe first; same severity -> by line number
     std::sort(findings.begin(), findings.end(), [](const Finding& a, const Finding& b) {
@@ -162,9 +204,16 @@ int main(int argc, char** argv) {
 
     const std::string report = buildReport(name, findings);
     std::cout << "\n" << report;
-
-    std::ofstream file("analysis_report.txt");
-    file << report;
+    { std::ofstream file("analysis_report.txt"); file << report; }
     std::cout << "Report saved to analysis_report.txt\n";
+
+    int fixCount = 0;
+    for (const Finding& f : findings) if (f.fixed) ++fixCount;
+    if (fixCount > 0) {
+        std::ofstream fixedFile("autofixed.cpp");
+        for (const std::string& l : fixedLines) fixedFile << l << "\n";
+        std::cout << fixCount << " automatic fix(es) written to autofixed.cpp\n"
+                  << "Your original file was NOT changed. Review autofixed.cpp before using it.\n";
+    }
     return 0;
 }

@@ -7,3 +7,4 @@ simulate_asan
 *.dSYM/
 analyzer
 analysis_report.txt
+sizeof_demo
