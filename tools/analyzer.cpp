@@ -1,8 +1,10 @@
-// analyzer.cpp - Day 6 (part A): scan C++ code, print a report, write an auto-fixed copy
+// analyzer.cpp - scan C++ code, report, auto-fix, then ask an AI about what is left
 //
 // Usage:
 //   ./analyzer path/to/file.cpp     analyze a file
 //   ./analyzer                      paste code, finish with a line containing only END
+//
+// AI provider: ollama (free, local, default) or claude. See ai_client.hpp.
 #include <algorithm>
 #include <fstream>
 #include <iostream>
@@ -10,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "ai_client.hpp"
 
 // One detection rule: "if a line matches this pattern, report this problem"
 struct Rule {
@@ -166,6 +169,140 @@ static std::string buildReport(const std::string& name, const std::vector<Findin
     return out.str();
 }
 
+// ======================= AI helpers =======================
+
+// A small local model has a small "memory window", so we limit how much code we send to it.
+// Online models can take much more.
+static const size_t kMaxCodeCharsLocal = 4000;
+static const size_t kMaxCodeCharsOnline = 40000;
+
+static std::vector<std::string> splitLines(const std::string& text) {
+    std::vector<std::string> lines;
+    std::istringstream in(text);
+    std::string line;
+    while (std::getline(in, line)) lines.push_back(line);
+    return lines;
+}
+
+static bool confirm(const std::string& question) {
+    std::cout << question << " [y/N]: " << std::flush;
+    std::string answer;
+    if (!std::getline(std::cin, answer)) return false;     // no input = no
+    return !answer.empty() && (answer[0] == 'y' || answer[0] == 'Y');
+}
+
+// One line per finding, used inside the AI prompts
+static std::string summarize(const std::vector<Finding>& findings) {
+    std::ostringstream out;
+    for (const Finding& f : findings) {
+        out << "- line " << f.line << " [" << f.rule->severity << "] " << f.rule->cwe << " "
+            << f.rule->title << ": " << f.code << "\n";
+    }
+    return out.str();
+}
+
+// Takes the code out of a ```cpp ... ``` block in the AI's answer.
+// complete = false if there was no closing fence (the answer may be cut off).
+static std::string extractCodeBlock(const std::string& text, bool& complete) {
+    complete = false;
+    const size_t open = text.find("```");
+    if (open == std::string::npos) return text;
+    const size_t start = text.find('\n', open);
+    if (start == std::string::npos) return text;
+    const size_t close = text.find("```", start);
+    if (close == std::string::npos) return text.substr(start + 1);
+    complete = true;
+    return text.substr(start + 1, close - start - 1);
+}
+
+static void offerAiHelp(const std::string& fixedCode, const std::vector<Finding>& findings,
+                        const std::vector<Rule>& rules) {
+    const std::string provider = ai::providerName();
+    std::cout << "\nAI provider: " << provider
+              << (provider == "ollama" ? " (runs on this computer, nothing is uploaded)"
+                                       : " (your code is sent to an online service)")
+              << "\n";
+
+    std::string error;
+
+    // ---- Step 1: explanations (only the findings are sent, not the whole file) ----
+    if (confirm("Ask the AI to explain the risks and suggest fixes?")) {
+        const std::string prompt =
+            "You are a secure C++ code reviewer. For each finding below, explain in two short "
+            "sentences why it is dangerous, then show one corrected line of code. Be concise.\n\n"
+            "Findings:\n" + summarize(findings);
+        std::cout << "\nAsking the AI... (this can take a while)\n";
+        const std::string answer = ai::ask(prompt, error, 1500);
+        if (answer.empty()) {
+            std::cerr << "AI error: " << error << "\n";
+        } else {
+            std::cout << "\n--- AI suggestions (may contain mistakes, please review) ---\n"
+                      << answer << "\n--- end ---\n";
+        }
+    }
+
+    // ---- Step 2: the AI only gets the problems the rules could NOT fix ----
+    std::vector<Finding> remainingBefore;
+    for (const Finding& f : findings) if (!f.fixed) remainingBefore.push_back(f);
+
+    if (remainingBefore.empty()) {
+        std::cout << "\nThe automatic fixes handled every finding, so there is nothing "
+                     "left for the AI to rewrite.\n";
+        return;
+    }
+
+    const size_t limit = (provider == "ollama") ? kMaxCodeCharsLocal : kMaxCodeCharsOnline;
+    if (fixedCode.size() > limit) {
+        std::cout << "\nThe code is " << fixedCode.size() << " characters. The AI step supports up to "
+                  << limit << " with provider " << provider << ".\n"
+                  << "Analyze a smaller file"
+                  << (provider == "ollama" ? ", or use AI_PROVIDER=claude." : ".") << "\n";
+        return;
+    }
+
+    if (confirm("Let the AI fix the " + std::to_string(remainingBefore.size()) +
+                " remaining problem(s)?")) {
+        const std::string prompt =
+            "The following C++ code was already partly fixed by an automatic tool. Fix ONLY the "
+            "remaining problems listed below. Do not change anything else: keep every other line, "
+            "the function names and the behaviour exactly as they are. Output ONLY the complete "
+            "code inside one ```cpp code block, with no explanation.\n\nRemaining problems:\n" +
+            summarize(remainingBefore) + "\nCode:\n```cpp\n" + fixedCode + "\n```\n";
+        std::cout << "\nGenerating corrected code... (this can take a while)\n";
+        const std::string answer = ai::ask(prompt, error, 2048);
+        if (answer.empty()) {
+            std::cerr << "AI error: " << error << "\n";
+            return;
+        }
+
+        bool complete = false;
+        const std::string result = extractCodeBlock(answer, complete);
+        if (!complete) {
+            std::cout << "Warning: the AI answer had no complete code block. It may be cut off "
+                         "or contain extra text. Check ai_fixed.cpp carefully.\n";
+        }
+        { std::ofstream file("ai_fixed.cpp"); file << result; }
+        std::cout << "AI code saved to ai_fixed.cpp. Your original file was NOT changed.\n";
+
+        // Trust but verify: scan the AI's code with our own rules
+        std::vector<std::string> ignored;
+        const std::vector<Finding> remaining = scan(splitLines(result), rules, ignored);
+        std::cout << "\nRe-scan of ai_fixed.cpp: " << remaining.size() << " finding(s) remain"
+                  << " (before the AI step: " << remainingBefore.size() << ")\n";
+        for (const Finding& f : remaining) {
+            std::cout << "  line " << f.line << " [" << f.rule->severity << "] "
+                      << f.rule->id << " " << f.rule->title << "\n";
+        }
+        if (remaining.empty()) {
+            std::cout << "  Our scanner found no known risky patterns. Still compile and test it!\n";
+        } else {
+            std::cout << "  The AI did not fix everything. Review before using.\n";
+        }
+    }
+}
+
+// ======================= main =======================
+
 int main(int argc, char** argv) {
     std::vector<std::string> lines;
     std::string name = "pasted_code";
@@ -214,6 +351,13 @@ int main(int argc, char** argv) {
         for (const std::string& l : fixedLines) fixedFile << l << "\n";
         std::cout << fixCount << " automatic fix(es) written to autofixed.cpp\n"
                   << "Your original file was NOT changed. Review autofixed.cpp before using it.\n";
+    }
+
+    if (!findings.empty()) {
+        // The AI sees the code AFTER the automatic fixes, so it only has to deal with the rest
+        std::string fixedCode;
+        for (const std::string& l : fixedLines) fixedCode += l + "\n";
+        offerAiHelp(fixedCode, findings, rules);
     }
     return 0;
 }

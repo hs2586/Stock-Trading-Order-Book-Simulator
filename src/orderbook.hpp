@@ -198,4 +198,26 @@ public:
                       << t.price / 100.0 << "\n";
         }
     }
+        // Top `depth` price levels as (price, total quantity), best price first
+    std::vector<std::pair<int64_t, int64_t>> bidLevels(size_t depth) const {
+        std::vector<std::pair<int64_t, int64_t>> out;
+        for (const auto& [price, queue] : bids_) {
+            if (out.size() == depth) break;
+            int64_t total = 0;
+            for (const Order& o : queue) total += o.qty;
+            out.emplace_back(price, total);
+        }
+        return out;
+    }
+
+    std::vector<std::pair<int64_t, int64_t>> askLevels(size_t depth) const {
+        std::vector<std::pair<int64_t, int64_t>> out;
+        for (const auto& [price, queue] : asks_) {
+            if (out.size() == depth) break;
+            int64_t total = 0;
+            for (const Order& o : queue) total += o.qty;
+            out.emplace_back(price, total);
+        }
+        return out;
+    }
 };
